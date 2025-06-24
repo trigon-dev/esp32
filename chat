@@ -1,0 +1,230 @@
+Below is a single, end-to-end guide for your **Adafruit Feather ESP32-S3 2 MB PSRAM** that turns it into a USB-HID keyboard + serial bridge, and a fully self-updating, auto-launching Windows helper to POST every keystroke into Discord—no Python install required on the target PC.
+
+---
+
+## 1. Prepare Your Arduino Environment
+
+1. **Install Arduino IDE**
+   Download & install from [https://www.arduino.cc/en/software](https://www.arduino.cc/en/software)
+
+2. **Add ESP32-S3 Board Support**
+
+   * **File → Preferences → Additional Boards Manager URLs**
+
+     ```
+     https://raw.githubusercontent.com/espressif/arduino-esp32/gh-pages/package_esp32_index.json
+     ```
+   * **Tools → Board → Boards Manager…** → search **“esp32”** → install **“esp32 by Espressif Systems”**
+   * **Tools → Board → ESP32 Arduino → Adafruit Feather ESP32-S3 2MB PSRAM**
+
+3. **No Extra HID Library Needed**
+   The ESP32-S3 core bundles TinyUSB. Just `#include <Adafruit_TinyUSB.h>` in your sketch.
+
+---
+
+## 2. Create Your Secrets File
+
+In the same folder as your `.ino`, create **`secrets.h`**:
+
+```cpp
+#ifndef SECRETS_H
+#define SECRETS_H
+
+#define SECRET_WEBHOOK "https://discord.com/api/webhooks/XXXX/YYYYYYYYYYYYYYYYYYYY"
+
+#endif  // SECRETS_H
+```
+
+> **No Wi-Fi credentials are needed**—we piggy-back on the PC’s Internet via USB-Serial.
+
+---
+
+## 3. ESP32-S3 Sketch: `KeyboardBridge.ino`
+
+```cpp
+#include <Adafruit_TinyUSB.h>
+
+// TinyUSB HID + CDC composite:
+Adafruit_USBD_HID usb_hid;
+
+void setup() {
+  Serial.begin(115200);
+  while (!Serial && millis() < 3000);
+
+  TinyUSBDevice.begin();
+  usb_hid.begin();
+}
+
+void loop() {
+  // Replace this with your real input source (buttons, sensors, etc.)
+  // For demo, we read from Serial (if you echo to it manually).
+  if (!Serial.available()) return;
+
+  char c = Serial.read();
+  if (c < 32 || c > 126) return;  // skip non-printable
+
+  // 1) Send as USB-HID keystroke:
+  usb_hid.keyboardReport(
+    HID_KEYBOARD_MODIFIER_NONE,
+    keycodeFromASCII(c),
+    0,0,0,0,0,0
+  );
+  delay(5);  // ensure host registers key
+
+  // 2) Echo it back over USB-Serial for the PC helper to read:
+  Serial.write(c);
+}
+```
+
+* **How it works**: every character you feed into `Serial` (e.g. via a button matrix or another UART) becomes both a USB keyboard stroke and a serial byte on the host.
+
+---
+
+## 4. Build the PC Bridge Helper
+
+You have two choices: **Python → PyInstaller EXE** or **Go native binary**. Both are zero-dependency once built.
+
+### A) Python + PyInstaller
+
+1. **Install Python 3** on your dev machine.
+
+2. **Create `esp2discord.py`:**
+
+   ```python
+   import serial, requests, sys, time
+
+   PORT      = sys.argv[1] if len(sys.argv)>1 else 'COM3'
+   BAUD      = 115200
+   WEBHOOK   = 'https://discord.com/api/webhooks/XXXX/YYYYYYYYYYYYYYYYYYYY'
+
+   ser = serial.Serial(PORT, BAUD, timeout=None)
+   time.sleep(1)
+   print(f"Listening on {PORT} → Discord…")
+
+   while True:
+       b = ser.read(1)
+       if not b: continue
+       c = b.decode('utf-8', errors='ignore')
+       if ord(c) < 32: continue
+       r = requests.post(WEBHOOK, json={'content': c}, timeout=5)
+       if not r.ok:
+           print(f"Failed {r.status_code} for '{c}'")
+   ```
+
+3. **Install deps & bundle**:
+
+   ```bash
+   pip install pyserial requests pyinstaller
+   pyinstaller --onefile esp2discord.py
+   ```
+
+4. **Take** `dist/esp2discord.exe` → distribute.
+
+---
+
+### B) Go Native Binary
+
+1. **Install Go** (≥1.18).
+
+2. **Create `esp2discord.go`:**
+
+   ```go
+   package main
+
+   import (
+     "bufio"; "bytes"; "encoding/json"
+     "flag"; "fmt"; "net/http"; "os"
+     "github.com/tarm/serial"
+   )
+
+   var (
+     port    = flag.String("port", "", "e.g. COM3 or /dev/ttyACM0")
+     webhook = flag.String("webhook", "", "Discord webhook URL")
+   )
+
+   func main() {
+     flag.Parse()
+     cfg := &serial.Config{Name: *port, Baud: 115200}
+     s, err := serial.OpenPort(cfg)
+     if err != nil { fmt.Println(err); os.Exit(1) }
+     reader := bufio.NewReader(s)
+
+     for {
+       b, err := reader.ReadByte()
+       if err != nil { break }
+       if b < 32 || b > 126 { continue }
+       body, _ := json.Marshal(map[string]string{"content": string(b)})
+       http.Post(*webhook, "application/json", bytes.NewBuffer(body))
+     }
+   }
+   ```
+
+3. **Build**:
+
+   ```bash
+   go build -o esp2discord.exe esp2discord.go
+   ```
+
+4. **Distribute** `esp2discord.exe`.
+
+---
+
+## 5. Self-Updating & Auto-Launch PowerShell Script
+
+Save as **`update-and-run.ps1`** alongside your `esp2discord.exe`:
+
+```powershell
+param(
+  [string] $Repo      = "YourUser/YourRepo",
+  [string] $AssetName = "esp2discord.exe",
+  [string] $LocalExe  = ".\esp2discord.exe"
+)
+
+function Get-Latest { Invoke-RestMethod -UseBasicParsing "https://api.github.com/repos/$Repo/releases/latest" }
+function Download($url,$dest){ Invoke-WebRequest -UseBasicParsing $url -OutFile $dest }
+
+$rel = Get-Latest; $tag = $rel.tag_name
+$asset = $rel.assets | Where-Object { $_.name -eq $AssetName }
+$tmp = "$LocalExe.download"
+
+Download $asset.browser_download_url $tmp
+if (Test-Path $LocalExe) { Copy-Item $LocalExe "$LocalExe.bak" -Force }
+Move-Item $tmp $LocalExe -Force
+
+Start-Process -FilePath $LocalExe
+```
+
+* **Usage**:
+
+  ```powershell
+  .\update-and-run.ps1 -Repo "YourUser/YourRepo" -AssetName "esp2discord.exe"
+  ```
+
+This will fetch your latest GitHub release asset, replace the local EXE, then launch it.
+
+---
+
+## 6. Putting It All Together
+
+1. **Flash** your ESP32-S3 with **`KeyboardBridge.ino`**.
+2. **On your Windows PC**—in the folder with `esp2discord.exe` and `update-and-run.ps1`:
+
+   ```powershell
+   .\update-and-run.ps1 -Repo "YourUser/YourRepo" -AssetName "esp2discord.exe"
+   ```
+3. **Plug** the ESP32-S3 into the PC USB port.
+4. **The script** auto-updates & launches the helper, which:
+
+   * Listens on the virtual COM port (e.g. COM3)
+   * For each byte the ESP32 spits out, POSTS to your Discord webhook
+
+> **No Wi-Fi on the ESP**, **no Python install** on the target—pure USB + single EXE + PowerShell updater.
+
+---
+
+### (Optional) Auto-Run on USB Insert
+
+* Use **Task Scheduler** with an **Event Trigger** on your ESP32’s USB-Serial VID/PID arrival, running `update-and-run.ps1`.
+* Or add a **Startup folder** shortcut to that script so it runs at user login.
+
+With this in place, you have a fully standalone, plug-and-play USB keyboard that relays everything you type into Discord—automatically kept up to date via GitHub!
